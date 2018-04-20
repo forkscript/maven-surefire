@@ -19,6 +19,7 @@ package org.apache.maven.plugin.surefire.booterclient;
  * under the License.
  */
 
+import org.apache.commons.io.FileUtils;
 import org.apache.maven.plugin.surefire.CommonReflector;
 import org.apache.maven.plugin.surefire.StartupReportConfiguration;
 import org.apache.maven.plugin.surefire.SurefireProperties;
@@ -49,6 +50,7 @@ import org.apache.maven.surefire.report.StackTraceWriter;
 import org.apache.maven.surefire.suite.RunResult;
 import org.apache.maven.surefire.testset.TestRequest;
 import org.apache.maven.surefire.util.DefaultScanResult;
+import org.apache.maven.surefire.util.internal.StringUtils;
 
 import javax.annotation.Nonnull;
 import java.io.Closeable;
@@ -383,10 +385,144 @@ public class ForkStarter
         }
     }
 
+    private RunResult runSuitesForkPerTestSetAsScript( final SurefireProperties effectiveSystemProperties,
+                                                       int forkCount )
+            throws SurefireBooterForkException
+    {
+        java.io.PrintWriter pw = null;
+        File script = null;
+        File logFile = null;
+        try
+        {
+            script = File.createTempFile( "forkscript", ".sh" );
+            script.setExecutable( true );
+            logFile = File.createTempFile( "forkscript", ".log" );
+
+            startupConfiguration.getClasspathConfiguration().getProviderClasspath()
+                    .writeToSystemProperty( "FORKSCRIPT_PROVIDERCLASSPATH" );
+            startupConfiguration.getClasspathConfiguration().getTestClasspath()
+                    .writeToSystemProperty( "FORKSCRIPT_TESTCLASSPATH" );
+
+            pw = new java.io.PrintWriter( script );
+            pw.println( "#!/bin/bash" );
+            for ( final Object testSet : getSuitesIterator() )
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.append( "timeout 10m java -cp " );
+                sb.append( System.getProperty( "FORKSCRIPT_PROVIDERCLASSPATH" ) );
+                sb.append( System.getProperty( "FORKSCRIPT_TESTCLASSPATH" ) );
+                sb.append( " org.apache.maven.surefire.junit4.BasicJunitRunListener " );
+                sb.append( testSet.toString().replace( "class ", " " ) ); // TODO: better way to get class name
+                sb.append( " >> " );
+                sb.append( logFile ); // TODO: better way to convert file to file path as string
+                sb.append( "\n" );
+                sb.append( "echo GOODBYE $?" );
+                sb.append( " >> " );
+                sb.append( logFile );
+                pw.println( sb );
+            }
+        }
+        catch ( IOException ex )
+        {
+            ex.printStackTrace();
+            // ignore
+        }
+        finally
+        {
+            try
+            {
+                pw.close();
+            }
+            catch ( Exception ex )
+            {
+                // ignore
+            }
+        }
+        RunResult globalResult = RunResult.noTestsRun();
+        try
+        {
+            Process p = new ProcessBuilder( script.getAbsolutePath() ).start();
+            p.waitFor();
+            globalResult = parseForkScriptResult( logFile );
+        }
+        catch ( IOException ex )
+        {
+            // ignore
+        }
+        catch ( InterruptedException ex )
+        {
+            // ignore
+        }
+        log.info( String.format( "Tests run: %d, Failures: %d, Errors: %d, Skipped: %d",
+                globalResult.getCompletedCount() + globalResult.getSkipped(), globalResult.getErrors(),
+                globalResult.getFailures(), globalResult.getSkipped() ) );
+        return globalResult;
+    }
+
+    private RunResult parseForkScriptResult( File logFile ) throws IOException
+    {
+        int completedCount = 0;
+        int errors = 0;
+        int failures = 0;
+        int skipped = 0;
+        int totalTimeMilli = 0;
+        for ( String line : FileUtils.readFileToString( logFile, "UTF-8" ).split( StringUtils.NL ) )
+        {
+            // TODO: better way to parse the output
+            String[] words = line.split( " " );
+            if ( words[0].equals( "[FORKSCRIPT]" ) )
+            {
+                if ( words[1].equals( "Run" ) && words[2].equals( "Count" ) )
+                {
+                    completedCount += Integer.valueOf( words[words.length - 1] );
+                    continue;
+                }
+                if ( words[1].equals( "Failure" ) )
+                {
+                    failures += Integer.valueOf( words[words.length - 1] );
+                    continue;
+                }
+                if ( words[1].equals( "Ignore" ) )
+                {
+                    skipped += Integer.valueOf( words[words.length - 1] );
+                    continue;
+                }
+                if ( words[1].equals( "Run" ) && words[2].equals( "Time" ) )
+                {
+                    totalTimeMilli += Integer.valueOf( words[words.length - 1] );
+                    log.info( line );
+                    continue;
+                }
+            }
+            if ( words[0].equals( "GOODBYE" ) )
+            {
+                if ( ! words[1].equals( "0" ) )
+                {
+                    errors += 1;
+                    continue;
+                }
+                else
+                {
+                    continue;
+                }
+            }
+            log.info( line );
+        }
+        log.info( String.format( "Total Time (ms) : %d", totalTimeMilli ) );
+        RunResult globalResult = new RunResult( completedCount, errors, failures, skipped );
+        return globalResult;
+    }
+
+
     @SuppressWarnings( "checkstyle:magicnumber" )
     private RunResult runSuitesForkPerTestSet( final SurefireProperties effectiveSystemProperties, int forkCount )
         throws SurefireBooterForkException
     {
+        if ( true )
+        {
+            return runSuitesForkPerTestSetAsScript( effectiveSystemProperties, forkCount );
+        }
+
         ArrayList<Future<RunResult>> results = new ArrayList<Future<RunResult>>( 500 );
         ThreadPoolExecutor executorService =
             new ThreadPoolExecutor( forkCount, forkCount, 60, SECONDS, new LinkedBlockingQueue<Runnable>() );
